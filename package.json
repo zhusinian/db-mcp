@@ -1,7 +1,7 @@
 {
   "name": "db-mcp",
   "version": "0.1.0",
-  "description": "Lightweight dynamic relational database MCP server for PostgreSQL and MySQL.",
+  "description": "Lightweight dynamic database MCP server for PostgreSQL, MySQL, and MongoDB.",
   "type": "module",
   "bin": {
     "db-mcp": "dist/index.js"
@@ -13,6 +13,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.18.2",
+    "bson": "^7.2.0",
+    "mongodb": "^7.3.0",
     "mysql2": "^3.15.3",
     "pg": "^8.16.3",
     "zod": "^3.25.76"

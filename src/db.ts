@@ -1,8 +1,10 @@
 import mysql from "mysql2/promise";
 import type { ConnectionOptions } from "mysql2";
+import { EJSON } from "bson";
+import { MongoClient, type Document } from "mongodb";
 import pg from "pg";
 
-export type DatabaseType = "postgres" | "mysql";
+export type DatabaseType = "postgres" | "mysql" | "mongodb";
 
 export type ConnectionConfig = {
   id?: string;
@@ -34,7 +36,13 @@ type MysqlHandle = {
   inTransaction: boolean;
 };
 
-type ConnectionHandle = PgHandle | MysqlHandle;
+type MongoHandle = {
+  type: "mongodb";
+  client: MongoClient;
+  database?: string;
+};
+
+type ConnectionHandle = PgHandle | MysqlHandle | MongoHandle;
 
 type MysqlExecuteValue = string | number | bigint | boolean | Date | null | Buffer | Uint8Array;
 
@@ -56,6 +64,10 @@ export class ConnectionManager {
   async execute(sql: string, params: unknown[] = [], connectionId?: string): Promise<QueryResult> {
     const handle = this.getConnection(connectionId);
 
+    if (handle.type === "mongodb") {
+      throw new Error("execute_sql can only be used with PostgreSQL/MySQL connections. Use execute_mongodb for MongoDB.");
+    }
+
     if (handle.type === "postgres") {
       const result = await handle.client.query(sql, params);
       return {
@@ -73,8 +85,22 @@ export class ConnectionManager {
     };
   }
 
+  async executeMongo(command: Document, database?: string, connectionId?: string): Promise<unknown> {
+    const handle = this.getConnection(connectionId);
+    if (handle.type !== "mongodb") {
+      throw new Error("execute_mongodb can only be used with MongoDB connections.");
+    }
+
+    const dbName = database ?? handle.database;
+    return handle.client.db(dbName).command(command);
+  }
+
   async begin(connectionId?: string): Promise<void> {
     const handle = this.getConnection(connectionId);
+    if (handle.type === "mongodb") {
+      throw new Error("Transaction helpers only support PostgreSQL/MySQL connections.");
+    }
+
     if (handle.inTransaction) {
       throw new Error("Transaction is already open for this connection.");
     }
@@ -85,6 +111,10 @@ export class ConnectionManager {
 
   async commit(connectionId?: string): Promise<void> {
     const handle = this.getConnection(connectionId);
+    if (handle.type === "mongodb") {
+      throw new Error("Transaction helpers only support PostgreSQL/MySQL connections.");
+    }
+
     if (!handle.inTransaction) {
       throw new Error("No transaction is open for this connection.");
     }
@@ -95,6 +125,10 @@ export class ConnectionManager {
 
   async rollback(connectionId?: string): Promise<void> {
     const handle = this.getConnection(connectionId);
+    if (handle.type === "mongodb") {
+      throw new Error("Transaction helpers only support PostgreSQL/MySQL connections.");
+    }
+
     if (!handle.inTransaction) {
       throw new Error("No transaction is open for this connection.");
     }
@@ -114,7 +148,9 @@ export class ConnectionManager {
       return;
     }
 
-    if (handle.type === "postgres") {
+    if (handle.type === "mongodb") {
+      await handle.client.close();
+    } else if (handle.type === "postgres") {
       await handle.client.end();
     } else {
       await handle.client.end();
@@ -145,6 +181,24 @@ export class ConnectionManager {
   }
 }
 
+export function parseMongoCommand(command: unknown, query?: string, commandJson?: string): Document {
+  const provided = [command !== undefined, query !== undefined, commandJson !== undefined].filter(Boolean).length;
+  if (provided !== 1) {
+    throw new Error("Provide exactly one of command, query, or commandJson.");
+  }
+
+  const value = query !== undefined || commandJson !== undefined ? EJSON.parse(query ?? commandJson ?? "") : command;
+  if (!isDocument(value) || Array.isArray(value)) {
+    throw new Error("MongoDB command must be a JSON object.");
+  }
+
+  if (Object.keys(value).length === 0) {
+    throw new Error("MongoDB command cannot be empty.");
+  }
+
+  return value;
+}
+
 async function createConnection(config: ConnectionConfig): Promise<ConnectionHandle> {
   if (config.type === "postgres") {
     const client = new pg.Client(
@@ -163,6 +217,12 @@ async function createConnection(config: ConnectionConfig): Promise<ConnectionHan
     return { type: "postgres", client, inTransaction: false };
   }
 
+  if (config.type === "mongodb") {
+    const client = new MongoClient(config.connectionString ?? createMongoUri(config), { tls: config.ssl });
+    await client.connect();
+    return { type: "mongodb", client, database: config.database };
+  }
+
   const client = config.connectionString
     ? await mysql.createConnection(config.connectionString)
     : await mysql.createConnection({
@@ -174,6 +234,17 @@ async function createConnection(config: ConnectionConfig): Promise<ConnectionHan
         ssl: config.ssl ? {} : undefined,
       } satisfies ConnectionOptions);
   return { type: "mysql", client, inTransaction: false };
+}
+
+function createMongoUri(config: ConnectionConfig): string {
+  const host = config.host ?? "localhost";
+  const port = config.port ?? 27017;
+  const auth = config.user ? `${encodeURIComponent(config.user)}:${encodeURIComponent(config.password ?? "")}@` : "";
+  return `mongodb://${auth}${host}:${port}`;
+}
+
+function isDocument(value: unknown): value is Document {
+  return value !== null && typeof value === "object";
 }
 
 function getMysqlRowCount(rows: unknown): number {
